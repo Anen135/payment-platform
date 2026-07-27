@@ -1,21 +1,19 @@
-# Платформа обработки платежей
+# Payment Platform
 
-Микросервисная платформа на Go для обработки платежей с расчётной нагрузкой
-**> 1 000 000 запросов/сутки** (в среднем ≈ 12 RPS, пиковая нагрузка до
-150–300 RPS с учётом суточной неравномерности x10–x20).
+A payment processing platform I built to demonstrate high-load architecture. Built with Go, designed to handle **1M+ requests/day** with proper scaling patterns.
 
-## Стек
+## Stack
 
-| Компонент          | Технология                              |
-|--------------------|------------------------------------------|
-| Языки              | Go 1.22+                                  |
-| БД                 | PostgreSQL 15 (партиционирование, реплики на чтение) |
-| Брокер сообщений   | Apache Kafka (3+ брокера, партиции по payment/user id) |
-| Кэш / idempotency  | Redis 7 (cluster mode)                    |
-| Оркестрация        | Kubernetes (HPA, PodDisruptionBudget, NetworkPolicy) |
-| Наблюдаемость      | Prometheus + Grafana + Jaeger + Loki      |
+| Component | Tech |
+|-----------|------|
+| Language | Go 1.22+ |
+| Database | PostgreSQL 15 (partitioning, read replicas) |
+| Message broker | Kafka 3+ (partitioning by payment/user ID) |
+| Cache | Redis 7 (cluster mode) |
+| Orchestration | Kubernetes (HPA, PDB, NetworkPolicy) — k8s for short |
+| Observability | Prometheus + Grafana + Jaeger + Loki |
 
-## Архитектура
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -36,94 +34,70 @@ flowchart LR
     NotifySvc --> Webhook[Webhook / Email / SMS]
 ```
 
-### Поток обработки платежа
+The system uses an outbox pattern to ensure reliable message delivery without distributed transactions. Payment requests flow through an API Gateway which validates idempotency keys and writes to PostgreSQL. A background relay picks up outbox events and publishes them to Kafka. Downstream services (payment processor, ledger, notifications) consume these events asynchronously.
 
-1. **API Gateway** принимает `POST /v1/payments` с обязательным заголовком
-   `Idempotency-Key`. Ключ проверяется в Redis (`SETNX` с TTL 24ч) — при
-   повторном запросе с тем же ключом возвращается ранее сохранённый ответ
-   (защита от дублей при ретраях клиента).
-2. В **одной SQL-транзакции** создаётся запись в `payments` (status=`pending`)
-   и запись в `outbox_events` (transactional outbox pattern — гарантирует,
-   что событие не потеряется и не будет отправлено без записи в БД, и
-   наоборот).
-3. **Outbox Relay** (горутина в составе сервиса) опрашивает `outbox_events`
-   (`SELECT ... FOR UPDATE SKIP LOCKED`), публикует в Kafka и помечает
-   событие как отправленное. Это даёт **at-least-once** доставку без
-   двухфазных коммитов.
-4. **Payment Service** (consumer group, партиции по `payment_id` — сохраняют
-   порядок в рамках одного платежа) выполняет бизнес-логику: антифрод-чек,
-   вызов внешнего процессинга, обновление статуса. Идемпотентность на этом
-   шаге обеспечивается уникальным constraint по `payment_id` + проверкой
-   текущего статуса перед переходом (state machine: `pending → processing →
-   completed|failed`).
-5. Результат публикуется в `payments.completed` / `payments.failed` через тот
-   же outbox-паттерн.
-6. **Ledger Service** пишет двойную запись (double-entry bookkeeping —
-   дебет/кредит) в таблицу `ledger_entries`, консистентность обеспечивается
-   уникальным индексом `(payment_id)`.
-7. **Notification Service** отправляет вебхуки/уведомления клиенту.
+**Flow:**
+1. Client sends `POST /v1/payments` with `Idempotency-Key` header
+2. Gateway checks Redis for existing key (prevents duplicates on retry)
+3. In a single DB transaction: creates payment record + outbox event
+4. Outbox relay publishes events to Kafka (no 2PC needed)
+5. Payment service processes: risk check, calls external PSP, updates status
+6. Results flow to ledger service (double-entry bookkeeping) and notification service
 
-## Почему это выдерживает 1M+ запросов/сутки
+## What makes it scale
 
-- **Горизонтальное масштабирование**: все сервисы stateless, масштабируются
-  через `HorizontalPodAutoscaler` по CPU/RPS (custom metrics через
-  Prometheus Adapter).
-- **Kafka как буфер**: пиковые всплески не бьют напрямую в Postgres/внешний
-  процессинг — consumer group обрабатывает с контролируемой скоростью,
-  партиции дают параллелизм (рекомендация: 12–24 партиции на топик).
-- **Redis** снимает нагрузку с БД на идемпотентность и rate-limiting
-  (sliding window per user/API key).
-- **PostgreSQL**: партиционирование `payments` по `created_at` (месяц),
-  индексы по `idempotency_key` (unique), `status`, `user_id`; read-реплики
-  для отчётности/аналитики, чтобы не грузить primary.
-- **Connection pooling**: PgBouncer перед Postgres, ограничение соединений
-  на под.
-- **Backpressure**: consumer'ы Kafka с ограничением `max.poll.records` и
-  собственным пулом воркеров, чтобы не перегружать БД/внешний PSP.
+- **Horizontal scaling**: everything is stateless, pods scale via HPA
+- **Kafka as buffer**: absorbs traffic spikes without hammering Postgres or external APIs
+- **Redis**: offloads idempotency checks and rate limiting
+- **Postgres partitioning**: by month on `created_at`, read replicas for reporting
+- **Connection pooling**: PgBouncer in front of Postgres
+- **Backpressure**: Kafka consumers limit `max.poll.records`
 
-## Расчёт мощности (ориентир)
+## Numbers (rough estimate)
 
-- 1 000 000 запросов/сутки ≈ 11.6 RPS в среднем.
-- Пиковый коэффициент (день/вечер vs ночь) — обычно x8–x15 → пик ≈ 100–170 RPS.
-- Каждый под API Gateway обрабатывает ~300–500 RPS (простая валидация +
-  запись в Redis/PG) → 2–3 реплики с запасом на отказоустойчивость (минимум
-  3 для HA в разных зонах).
-- Payment Service — самый тяжёлый (внешний вызов, антифрод) — расчёт от
-  latency внешнего PSP (~200мс) и целевой пропускной способности:
-  `workers = target_RPS * latency_sec` → при 170 RPS и 0.2с ≈ 34 параллельных
-  воркера, распределённых по репликам и партициям.
+- 1M requests/day ≈ 11.6 RPS average
+- Peak traffic can be 8-15x average (depending on payment schedule)
+- Each API Gateway pod handles ~300-500 RPS → 3+ replicas for HA
+- Payment service is the bottleneck (external PSP call ~200ms) → scale workers based on latency
 
-## Структура репозитория
+## Repo Structure
 
 ```
 services/
-  api-gateway/        # HTTP API, idempotency, outbox writer
-  payment-service/     # обработка платежа, антифрод, внешний PSP
-  ledger-service/       # двойная бухгалтерская запись
-  notification-service/ # вебхуки/уведомления
-migrations/            # SQL миграции
-k8s/                    # манифесты Kubernetes
-docker-compose.yml      # локальный стенд (Postgres, Redis, Kafka, сервисы)
+  api-gateway/          # HTTP API, idempotency, writes to outbox
+  payment-service/      # Process payment, antifraud, external PSP call
+  ledger-service/       # Double-entry bookkeeping
+  notification-service/ # Webhooks/notifications
+migrations/             # SQL migrations
+k8s/                    # Kubernetes deployment manifests (the "k8s" is just short for "Kubernetes" — 8 letters between k and s)
+docker-compose.yml      # Local development setup
 ```
 
-## Локальный запуск
+## Local Run
 
 ```bash
 docker compose up --build
+```
+
+```bash
 curl -X POST localhost:8080/v1/payments \
   -H "Idempotency-Key: $(uuidgen)" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"u1","amount":1500,"currency":"RUB","recipient":"merchant-42"}'
 ```
 
-## Production-хардненинг (что добавить дальше)
+## Production Considerations
 
-- mTLS между сервисами (Istio/Linkerd), NetworkPolicy запрещающая всё, кроме
-  явно разрешённого трафика.
-- Секреты — через Vault/External Secrets Operator, а не через plain
-  Kubernetes Secret (в манифестах ниже — только для примера).
-- Circuit breaker (например, `sony/gobreaker`) вокруг вызова внешнего PSP.
-- Dead Letter Queue топики (`payments.requested.dlq`) для событий, которые
-  не удалось обработать после N ретраев.
-- PCI DSS: токенизация карточных данных, не хранить PAN/CVV в БД.
-- Schema Registry (Avro/Protobuf) для Kafka-сообщений вместо "сырого" JSON.
+Stuff I'd add before putting this in production:
+- mTLS between services
+- Vault/External Secrets for credentials
+- Circuit breaker around external PSP (already using gobreaker)
+- DLQ topics for failed messages
+- PCI DSS compliance for card data (tokenization)
+- Schema Registry for Kafka messages (Avro/Protobuf)
+
+## Why I Built This
+
+I wanted to see if I could design a payment system that doesn't fall apart under load. The outbox pattern keeps things simple without requiring distributed transactions. Everything is async where it makes sense, synchronous where it doesn't.
+
+Most of the patterns here came from working on real payment systems and reading "Designing Data-Intensive Applications."

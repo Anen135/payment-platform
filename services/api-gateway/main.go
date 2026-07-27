@@ -1,6 +1,3 @@
-// API Gateway: принимает платёжные запросы, обеспечивает идемпотентность
-// через Redis и пишет платёж + outbox-событие в одной транзакции Postgres.
-// Отдельная горутина (outbox relay) публикует события в Kafka.
 package main
 
 import (
@@ -55,7 +52,7 @@ func main() {
 
 	writer := &kafka.Writer{
 		Addr:                   kafka.TCP(kafkaBrokers),
-		Balancer:               &kafka.Hash{}, // партиционирование по ключу (payment_id) — сохраняет порядок
+		Balancer:               &kafka.Hash{},
 		AllowAutoTopicCreation: true,
 		BatchTimeout:           10 * time.Millisecond,
 	}
@@ -63,7 +60,7 @@ func main() {
 
 	srv := &Server{db: pool, rdb: rdb, writer: writer}
 
-	// Outbox relay: фоновая публикация неотправленных событий в Kafka
+	// background job that publishes any pending outbox events to Kafka
 	go srv.runOutboxRelay(ctx)
 
 	mux := http.NewServeMux()
@@ -114,9 +111,7 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Быстрая проверка идемпотентности через Redis (SETNX + TTL 24ч).
-	// Здесь хранится только "занятость" ключа; финальный ответ идёт из БД,
-	// чтобы избежать рассинхронизации Redis/Postgres.
+	// check idempotency key in Redis first
 	lockKey := "idem:" + idemKey
 	acquired, err := s.rdb.SetNX(ctx, lockKey, "1", 24*time.Hour).Result()
 	if err != nil {
@@ -124,7 +119,6 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err == nil && !acquired {
-		// Ключ уже использован — ищем существующий платёж в БД
 		resp, found, err := s.findByIdempotencyKey(ctx, idemKey)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -134,7 +128,6 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, resp)
 			return
 		}
-		// Гонка: ключ уже занят в Redis, но запись в БД ещё не успела появиться
 		http.Error(w, "request with this idempotency key is being processed", http.StatusConflict)
 		return
 	}
@@ -194,9 +187,7 @@ func (s *Server) findByIdempotencyKey(ctx context.Context, key string) (PaymentR
 	return resp, true, nil
 }
 
-// runOutboxRelay периодически публикует неотправленные события из outbox_events
-// в Kafka, используя SELECT ... FOR UPDATE SKIP LOCKED для безопасной работы
-// нескольких реплик сервиса параллельно.
+// periodically publish any unsent events from outbox_events to Kafka
 func (s *Server) runOutboxRelay(ctx context.Context) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -264,7 +255,7 @@ func (s *Server) relayBatch(ctx context.Context) error {
 	}
 
 	if err := s.writer.WriteMessages(ctx, msgs...); err != nil {
-		return err // не коммитим — попробуем снова на следующем тике
+		return err
 	}
 
 	_, err = tx.Exec(ctx, `

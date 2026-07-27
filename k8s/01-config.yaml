@@ -7,8 +7,6 @@ data:
   KAFKA_BROKERS: "kafka-bootstrap.payments.svc.cluster.local:9092"
   REDIS_ADDR: "redis.payments.svc.cluster.local:6379"
 ---
-# ВНИМАНИЕ: в проде секреты должны идти через Vault / External Secrets
-# Operator / Sealed Secrets, а не как обычный Kubernetes Secret в git.
 apiVersion: v1
 kind: Secret
 metadata:

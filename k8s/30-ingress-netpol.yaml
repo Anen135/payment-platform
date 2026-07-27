@@ -20,7 +20,6 @@ spec:
             backend:
               service: {name: api-gateway, port: {number: 80}}
 ---
-# По умолчанию запрещаем весь трафик, затем разрешаем только нужное.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

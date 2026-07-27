@@ -1,6 +1,3 @@
-// Notification Service: слушает payments.completed и payments.failed,
-// отправляет уведомление клиенту (вебхук/email/SMS — здесь симулировано
-// логированием + HTTP POST на настраиваемый webhook URL).
 package main
 
 import (
@@ -26,7 +23,7 @@ func main() {
 	}
 
 	log.Println("notification-service started")
-	select {} // держим процесс живым; горутины работают в фоне
+	select {}
 }
 
 func consume(ctx context.Context, brokers, topic, webhookURL string) {
@@ -50,7 +47,7 @@ func consume(ctx context.Context, brokers, topic, webhookURL string) {
 		if webhookURL != "" {
 			if err := postWebhook(client, webhookURL, m.Value); err != nil {
 				log.Printf("[%s] webhook delivery failed, will retry: %v", topic, err)
-				continue // не коммитим -> повторная попытка при следующей доставке
+				continue
 			}
 		} else {
 			log.Printf("[%s] notification: %s", topic, string(m.Value))

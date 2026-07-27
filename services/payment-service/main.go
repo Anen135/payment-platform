@@ -1,6 +1,3 @@
-// Payment Service: consumer группа читает payments.requested, выполняет
-// антифрод-проверку и вызов внешнего процессинга (PSP), обновляет статус
-// платежа и пишет результат в outbox для дальнейшей публикации в Kafka.
 package main
 
 import (
@@ -50,7 +47,7 @@ func main() {
 		Topic:          "payments.requested",
 		MinBytes:       1,
 		MaxBytes:       10e6,
-		CommitInterval: 0, // ручной коммит после успешной обработки — at-least-once
+		CommitInterval: 0, // manual commit after processing
 	})
 	defer reader.Close()
 
@@ -72,9 +69,7 @@ func main() {
 
 	w := &Worker{db: pool, writer: writer, breaker: cb}
 
-	// Пул воркеров для параллельной обработки сообщений одного консьюмера.
-	// Реальный параллелизм достигается количеством партиций топика и
-	// количеством реплик сервиса (каждая реплика = 1 consumer в группе).
+	// simple worker pool
 	concurrency := 8
 	msgCh := make(chan kafka.Message, concurrency*2)
 
@@ -107,9 +102,6 @@ func (w *Worker) process(ctx context.Context, reader *kafka.Reader, m kafka.Mess
 
 	if err := w.handlePayment(ctx, evt); err != nil {
 		log.Printf("payment %s processing error: %v (will retry via redelivery)", evt.PaymentID, err)
-		// Не коммитим offset — сообщение будет повторно доставлено.
-		// В проде: счётчик ретраев в заголовке сообщения + DLQ топик
-		// payments.requested.dlq после N попыток.
 		return
 	}
 
@@ -119,7 +111,7 @@ func (w *Worker) process(ctx context.Context, reader *kafka.Reader, m kafka.Mess
 }
 
 func (w *Worker) handlePayment(ctx context.Context, evt RequestedEvent) error {
-	// Идемпотентный переход pending -> processing.
+	// idempotent state transition pending -> processing
 	tx, err := w.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -134,7 +126,6 @@ func (w *Worker) handlePayment(ctx context.Context, evt RequestedEvent) error {
 	}
 
 	if status != "pending" {
-		// Уже обработан (повторная доставка) — ничего не делаем, коммитим offset выше.
 		return tx.Commit(ctx)
 	}
 
@@ -145,11 +136,10 @@ func (w *Worker) handlePayment(ctx context.Context, evt RequestedEvent) error {
 		return err
 	}
 
-	// Антифрод + вызов внешнего PSP — за пределами транзакции БД (I/O),
-	// обёрнуты circuit breaker'ом.
+	// antifraud + external PSP call
 	approved, reason, err := w.riskCheckAndCharge(ctx, evt)
 	if err != nil {
-		return err // сеть/PSP недоступен -> ретрай всего события
+		return err
 	}
 
 	finalStatus := "completed"
@@ -192,8 +182,8 @@ func (w *Worker) handlePayment(ctx context.Context, evt RequestedEvent) error {
 	return w.relayOutboxEvent(ctx, evt.PaymentID, topic, payload)
 }
 
-// relayOutboxEvent публикует событие сразу (best-effort), но т.к. запись
-// уже лежит в outbox_events, отдельный relay-процесс подчистит недоставленное.
+// relayOutboxEvent publishes event immediately, but outbox_events record
+// ensures no data loss if Kafka is temporarily down.
 func (w *Worker) relayOutboxEvent(ctx context.Context, paymentID, topic string, payload []byte) error {
 	_, err := w.breaker.Execute(func() (any, error) {
 		return nil, w.writer.WriteMessages(ctx, kafka.Message{
@@ -204,23 +194,22 @@ func (w *Worker) relayOutboxEvent(ctx context.Context, paymentID, topic string, 
 	})
 	if err != nil {
 		log.Printf("kafka publish deferred to relay for %s: %v", paymentID, err)
-		return nil // не фатально — фоновый relay (см. relay.go) досоздаст
+		return nil
 	}
 	_, _ = w.db.Exec(ctx, `UPDATE outbox_events SET published = true, published_at = now()
 		WHERE aggregate_id = $1 AND topic = $2 AND NOT published`, paymentID, topic)
 	return nil
 }
 
-// riskCheckAndCharge — симуляция антифрод-проверки и вызова внешнего PSP.
-// В реальной системе — HTTP/gRPC вызов с таймаутом и ретраями.
+// riskCheckAndCharge simulates antifraud check and external PSP call.
 func (w *Worker) riskCheckAndCharge(ctx context.Context, evt RequestedEvent) (approved bool, reason string, err error) {
 	result, cbErr := w.breaker.Execute(func() (any, error) {
 		select {
-		case <-time.After(50 * time.Millisecond): // имитация latency внешнего сервиса
+		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		if evt.Amount > 1_000_000_00 { // порог антифрода (в минимальных единицах валюты)
+		if evt.Amount > 1_000_000_00 {
 			return false, nil
 		}
 		return true, nil
@@ -234,7 +223,7 @@ func (w *Worker) riskCheckAndCharge(ctx context.Context, evt RequestedEvent) (ap
 	if approvedVal, ok := result.(bool); ok && !approvedVal {
 		return false, "risk_check_declined", nil
 	}
-	// небольшая случайная доля отказов внешнего PSP для реалистичности демо
+	// occasional PSP failure for demo realism
 	if rand.Intn(1000) == 0 {
 		return false, "psp_declined", nil
 	}

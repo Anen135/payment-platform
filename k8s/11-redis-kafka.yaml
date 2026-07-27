@@ -1,6 +1,4 @@
-# Рекомендация для production: Redis — через Bitnami Helm chart в режиме
-# Cluster/Sentinel (для HA), Kafka — через Strimzi operator (см. ниже
-# минимальный пример Kafka CR). Здесь — простой одиночный Redis для примера.
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,9 +26,7 @@ metadata:
 spec:
   selector: {app: redis}
   ports: [{port: 6379, targetPort: 6379}]
----
-# Пример Kafka-кластера через Strimzi operator (требует установленного
-# strimzi-kafka-operator в кластере: helm install strimzi strimzi/strimzi-kafka-operator).
+
 apiVersion: kafka.strimzi.io/v1beta2
 kind: Kafka
 metadata:

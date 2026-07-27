@@ -1,6 +1,3 @@
-# Для production рекомендуется управляемый Postgres (RDS/Cloud SQL) или
-# оператор (CloudNativePG / Zalando postgres-operator) с репликами на чтение.
-# Ниже — упрощённый StatefulSet для примера/dev-кластера.
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:

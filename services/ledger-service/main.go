@@ -1,6 +1,3 @@
-// Ledger Service: консьюмер payments.completed, пишет двойную бухгалтерскую
-// запись (debit/credit) в ledger_entries. Идемпотентно за счёт уникального
-// индекса (payment_id, direction) — повторная доставка не создаст дубли.
 package main
 
 import (
@@ -42,6 +39,7 @@ func main() {
 	defer reader.Close()
 
 	log.Println("ledger-service started")
+
 	for {
 		m, err := reader.FetchMessage(ctx)
 		if err != nil {
@@ -57,8 +55,8 @@ func main() {
 		}
 
 		if err := writeDoubleEntry(ctx, pool, evt); err != nil {
-			log.Printf("ledger write failed for %s: %v (will retry)", evt.PaymentID, err)
-			continue // не коммитим -> повторная доставка
+			log.Printf("ledger write failed for %s: %v", evt.PaymentID, err)
+			continue
 		}
 
 		if err := reader.CommitMessages(ctx, m); err != nil {
@@ -74,8 +72,7 @@ func writeDoubleEntry(ctx context.Context, pool *pgxpool.Pool, evt CompletedEven
 	}
 	defer tx.Rollback(ctx)
 
-	// ON CONFLICT DO NOTHING — благодаря уникальному индексу (payment_id, direction)
-	// повторная доставка события не создаст дублирующую проводку.
+	// debit: money leaves user's account
 	_, err = tx.Exec(ctx, `
 		INSERT INTO ledger_entries (payment_id, account_id, direction, amount, currency)
 		VALUES ($1, $2, 'debit', $3, $4)
@@ -85,6 +82,7 @@ func writeDoubleEntry(ctx context.Context, pool *pgxpool.Pool, evt CompletedEven
 		return err
 	}
 
+	// credit: money arrives at merchant's account
 	_, err = tx.Exec(ctx, `
 		INSERT INTO ledger_entries (payment_id, account_id, direction, amount, currency)
 		VALUES ($1, $2, 'credit', $3, $4)
