@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: payments
+spec:
+  replicas: 4
+  selector: {matchLabels: {app: payment-service}}
+  template:
+    metadata: {labels: {app: payment-service}}
+    spec:
+      containers:
+        - name: payment-service
+          image: registry.example.com/payments/payment-service:latest
+          env:
+            - name: KAFKA_GROUP_ID
+              value: payment-service
+          envFrom:
+            - configMapRef: {name: payments-config}
+            - secretRef: {name: payments-secrets}
+          resources:
+            requests: {cpu: "300m", memory: "256Mi"}
+            limits: {cpu: "1500m", memory: "1Gi"}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: payment-service}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: payment-service
+  namespace: payments
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: payment-service}
+  # Не превышать число партиций топика payments.requested (12) —
+  # лишние реплики просто будут простаивать без партиций.
+  minReplicas: 4
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service
+  namespace: payments
+spec:
+  minAvailable: 2
+  selector: {matchLabels: {app: payment-service}}

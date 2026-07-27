@@ -1,0 +1,48 @@
+# Для production рекомендуется управляемый Postgres (RDS/Cloud SQL) или
+# оператор (CloudNativePG / Zalando postgres-operator) с репликами на чтение.
+# Ниже — упрощённый StatefulSet для примера/dev-кластера.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: payments
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15
+          env:
+            - name: POSTGRES_USER
+              value: payment
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: payments-secrets, key: DATABASE_URL}
+            - name: POSTGRES_DB
+              value: payments
+          ports: [{containerPort: 5432}]
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+          resources:
+            requests: {cpu: "500m", memory: "1Gi"}
+            limits: {cpu: "2", memory: "4Gi"}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: {requests: {storage: 50Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: payments
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432, targetPort: 5432}]
